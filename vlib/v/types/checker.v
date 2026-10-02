@@ -1046,6 +1046,7 @@ mut:
 	// Includes method-value aliases and binding-owner maps; all backing maps are
 	// replaced together at every function/worker boundary.
 	fn_context               FunctionCheckContext
+	selective_import_index   &SelectiveImportIndex    = &SelectiveImportIndex{}
 	type_cache               &TypeCache               = unsafe { nil }
 	pre_transform_type_cache &TypeCache               = unsafe { nil }
 	resolution_type_views    &ResolutionTypeViewCache = unsafe { nil }
@@ -1698,6 +1699,8 @@ pub fn (tc &TypeChecker) discard_type_cache_overlay_after_forks() {
 // checkers use this so the lazily-built lookup indexes and memoizations work
 // per worker instead of falling back to their uncached full scans.
 pub fn (mut tc TypeChecker) set_fresh_type_cache(parse_enabled bool) {
+	// The import index can hold keys allocated in the same disposable stage arena.
+	tc.selective_import_index = &SelectiveImportIndex{}
 	if isnil(tc.type_interner) {
 		tc.type_interner = new_type_interner()
 	}
@@ -1756,6 +1759,7 @@ pub fn (mut tc TypeChecker) reset_type_interners() {
 // parallel-cgen workers start with every type memoized by the check/transform
 // phases instead of re-deriving them from a cold cache.
 pub fn (mut tc TypeChecker) set_fresh_type_cache_based_on(src &TypeChecker, parse_enabled bool) {
+	tc.selective_import_index = &SelectiveImportIndex{}
 	base := if isnil(src.type_cache) {
 		&TypeCache(unsafe { nil })
 	} else if !isnil(src.type_cache.base) {
@@ -2413,8 +2417,9 @@ fn (mut tc TypeChecker) cache_fn_generic_params_of(a &flat.FlatAst, entries []i3
 			continue
 		}
 		params := tc.infer_decl_generic_param_names(node)
+		// Keep non-generic declarations too, so call validation can reuse the miss.
+		tc.enclosing_generic_params_by_node[idx] = params
 		if params.len > 0 {
-			tc.enclosing_generic_params_by_node[idx] = params
 			tc.fill_enclosing_generic_param_mask(previous_top_level_idx + 1, idx + 1, params)
 		}
 		previous_top_level_idx = idx
@@ -3727,6 +3732,21 @@ fn (mut tc TypeChecker) register_declaration_visibility(node flat.Node, module_n
 		.struct_decl, .type_decl, .interface_decl, .enum_decl {
 			name := qualify_decl_name_in_module(node.value, module_name)
 			tc.declaration_visibility[name] = visibility
+			if node.kind == .interface_decl {
+				for i in 0 .. node.children_count {
+					field := tc.a.child_node(&node, i)
+					if field.kind == .interface_field && field.op == .dot {
+						// Abstract methods belong to the interface contract. Record their
+						// qualified names so lookup cannot select an unrelated private method
+						// on a concrete type with the same short name in another module.
+						tc.declaration_visibility['${name}.${field.value}'] = DeclarationVisibility{
+							module_name: module_name
+							kind:        .fn_decl
+							is_pub:      true
+						}
+					}
+				}
+			}
 		}
 		.const_decl {
 			for i in 0 .. node.children_count {
@@ -5857,6 +5877,16 @@ pub fn (tc &TypeChecker) parse_resolution_type(typ string) Type {
 		}
 	}
 	if isnil(tc.resolution_type_views) {
+		if !isnil(tc.type_cache) && tc.type_cache.parse_enabled
+			&& tc.type_cache.alias_parse_stack.len == 0 {
+			// The uncached view below parses with no module or generic parameters.
+			// Reuse that exact parse entry before allocating another checker view.
+			mut cache := tc.type_cache
+			if cached := parse_type_cache_get_mode(mut cache, tc.cur_file, '', qualified, []string{}, false, tc.fast_parse_recent) {
+				cache.parse_hits++
+				return cached
+			}
+		}
 		mut direct_view := tc.fork_type_parse_view(tc.cur_file, '')
 		direct_view.resolution_type_mode = false
 		return direct_view.parse_type(qualified)
@@ -6270,13 +6300,28 @@ fn (tc &TypeChecker) private_declaration(name string) ?DeclarationVisibility {
 	if name.starts_with('C.') && c_struct_module_key(tc.cur_module, name) in tc.c_struct_scoped_fields {
 		return none
 	}
+	mut declaration_name := name
+	if name.contains('.') {
+		receiver_name := visible_mutation_fn_lookup_name(name).all_before_last('.')
+		if receiver_name in tc.interface_names {
+			// Inherited methods use the base interface's declaration for access checks.
+			declaration_name = tc.interface_method_signature_key(receiver_name,
+				name.all_after_last('.')) or { name }
+		}
+	}
+	if visibility := tc.declaration_visibility[declaration_name] {
+		if declaration_visibility_is_private(visibility, tc.cur_module) {
+			return visibility
+		}
+		return none
+	}
 	mut candidates := []string{}
-	for candidate in [name, visible_mutation_fn_lookup_name(name)] {
+	for candidate in [declaration_name, visible_mutation_fn_lookup_name(declaration_name)] {
 		if candidate.len > 0 && candidate !in candidates {
 			candidates << candidate
 		}
 	}
-	mut shortened := name
+	mut shortened := declaration_name
 	for shortened.contains('.') {
 		tail := shortened.all_after('.')
 		if !tail.contains('.') {
@@ -6291,13 +6336,18 @@ fn (tc &TypeChecker) private_declaration(name string) ?DeclarationVisibility {
 	}
 	for candidate in candidates {
 		visibility := tc.declaration_visibility[candidate] or { continue }
-		same_main_module := visibility.module_name in ['', 'main'] && tc.cur_module in ['', 'main']
-		if !visibility.is_pub && visibility.module_name != tc.cur_module && !same_main_module {
+		if declaration_visibility_is_private(visibility, tc.cur_module) {
 			return visibility
 		}
 		return none
 	}
 	return none
+}
+
+@[inline]
+fn declaration_visibility_is_private(visibility DeclarationVisibility, current_module string) bool {
+	same_main_module := visibility.module_name in ['', 'main'] && current_module in ['', 'main']
+	return !visibility.is_pub && visibility.module_name != current_module && !same_main_module
 }
 
 fn (mut tc TypeChecker) check_selective_const_imports(node flat.Node, module_path string) {
@@ -6914,6 +6964,37 @@ mut:
 	seen_len int             = -1
 }
 
+// Index source keys, not resolved declarations: signature availability and
+// module context can change during generic specialization.
+struct SelectiveImportIndex {
+mut:
+	keys_by_name map[string][]string
+	seen_len     int = -1
+}
+
+fn (tc &TypeChecker) selective_import_fallback_keys(name string) []string {
+	mut index := tc.selective_import_index
+	if isnil(index) {
+		// Lightweight checker views without caches retain the same lookup rules.
+		mut keys := []string{}
+		suffix := '\n${name}'
+		for key, _ in tc.file_selective_imports {
+			if key.ends_with(suffix) {
+				keys << key
+			}
+		}
+		return keys
+	}
+	if index.seen_len != tc.file_selective_imports.len {
+		index.keys_by_name.clear()
+		for key, _ in tc.file_selective_imports {
+			index.keys_by_name[key.all_after_last('\n')] << key
+		}
+		index.seen_len = tc.file_selective_imports.len
+	}
+	return index.keys_by_name[name] or { []string{} }
+}
+
 fn (tc &TypeChecker) current_file_import_info() &FileImportInfo {
 	mut cache := tc.import_info_cache
 	if isnil(cache) {
@@ -6949,14 +7030,13 @@ fn (tc &TypeChecker) resolve_selective_import_symbol(name string) ?string {
 			return tc.vsh_os_fn_symbol(name)
 		}
 		mut resolved := ''
-		suffix := '\n${name}'
-		for key, fallback_candidates in tc.file_selective_imports {
-			if !key.ends_with(suffix) {
-				continue
-			}
+		for key in tc.selective_import_fallback_keys(name) {
 			if tc.file_modules[key.all_before_last('\n')] != tc.cur_module {
 				continue
 			}
+			// Only matching imports need candidate values; copying every array here
+			// accumulates allocations while resolving generic bodies.
+			fallback_candidates := tc.file_selective_imports[key] or { []string{} }
 			for candidate in fallback_candidates {
 				if !tc.fn_signature_known(candidate) && candidate !in tc.fn_ret_types && candidate !in tc.fn_param_types {
 					continue
@@ -6985,14 +7065,11 @@ fn (tc &TypeChecker) resolve_selective_import_symbol(name string) ?string {
 // when every source file that selects the name agrees on the same declaration.
 pub fn (tc &TypeChecker) resolve_any_selective_import_fn(name string) ?string {
 	mut resolved := ''
-	suffix := '\n${name}'
-	for key, candidates in tc.file_selective_imports {
-		if !key.ends_with(suffix) {
-			continue
-		}
+	for key in tc.selective_import_fallback_keys(name) {
 		if tc.file_modules[key.all_before_last('\n')] != tc.cur_module {
 			continue
 		}
+		candidates := tc.file_selective_imports[key] or { []string{} }
 		for candidate in candidates {
 			if !tc.fn_signature_known(candidate) && candidate !in tc.fn_ret_types && candidate !in tc.fn_param_types {
 				continue
@@ -11847,6 +11924,18 @@ fn (mut tc TypeChecker) collect_selected_file_node_called_fns(id flat.NodeId) {
 		.call {
 			if name := tc.selected_file_call_name(node) {
 				tc.enqueue_selected_file_fn(name)
+				callee := tc.a.child_node(&node, 0)
+				if callee.kind in [.ident, .selector] && tc.fn_signature_known(name) {
+					// A resolved callee already keeps its declaration. Visit its receiver
+					// and the arguments without resolving the callee again as a fn value.
+					for i in 0 .. callee.children_count {
+						tc.collect_selected_file_node_called_fns(tc.a.child(callee, i))
+					}
+					for i in 1 .. node.children_count {
+						tc.collect_selected_file_node_called_fns(tc.a.child(&node, i))
+					}
+					return
+				}
 			}
 		}
 		.ident, .selector {
